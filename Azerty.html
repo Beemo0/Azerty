@@ -1,0 +1,444 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>Live Beat Squares - OpenCV.js tracking (audio-reactive)</title>
+<style>
+  body { margin:0; overflow:hidden; background:black; }
+  canvas { display:block; width:100vw; height:100vh; object-fit:cover; }
+  #loading { position:fixed; left:10px; top:10px; color:#fff; font-family:monospace; z-index:100; background: rgba(0,0,0,0.6); padding:6px 8px; border-radius:6px;}
+  #hint { position:fixed; right:10px; top:10px; color:#fff; font-family:monospace; z-index:100; background: rgba(0,0,0,0.6); padding:6px 8px; border-radius:6px;}
+</style>
+</head>
+<body>
+<div id="loading">Loading OpenCV...</div>
+<div id="hint">Tap/click to enable mic (mobile)</div>
+<video id="video" autoplay playsinline style="display:none;"></video>
+<canvas id="canvas"></canvas>
+
+<script async src="https://docs.opencv.org/4.x/opencv.js"></script>
+
+<script>
+/* -------------------------
+   Globals & DOM
+   ------------------------- */
+const video = document.getElementById('video');
+const canvas = document.getElementById('canvas');
+const ctx = canvas.getContext('2d');
+const loading = document.getElementById('loading');
+const hint = document.getElementById('hint');
+
+let width = window.innerWidth;
+let height = window.innerHeight;
+canvas.width = width;
+canvas.height = height;
+
+let neighbor_links = 3;
+let pts_per_frame = 5;
+let jitter_px = 0.5;
+let life_frames = 15;
+let min_size = 15;
+let max_size = 40;
+
+/* -------------------------
+   TrackedPoint class + helpers
+   ------------------------- */
+class TrackedPoint {
+  constructor(pos, life, size, label, font_scale, color, vertical) {
+    this.pos = pos;
+    this.life = life|0;
+    this.size = size|0;
+    this.label = label;
+    this.font_scale = font_scale;
+    this.color = color;
+    this.vertical = vertical;
+  }
+}
+function sampleSizeBell(minS, maxS, widthDiv=6.0){
+  const mean = (minS+maxS)/2;
+  const sigma = (maxS-minS)/widthDiv;
+  for(let i=0;i<10;i++){
+    const val = mean + sigma * randNormal();
+    if(val>=minS && val<=maxS) return Math.round(val);
+  }
+  return Math.round(Math.max(minS, Math.min(maxS, mean)));
+}
+function randNormal(){
+  let u=0,v=0;
+  while(u===0) u=Math.random();
+  while(v===0) v=Math.random();
+  return Math.sqrt(-2*Math.log(u))*Math.cos(2*Math.PI*v);
+}
+
+/* -------------------------
+   Motion / OpenCV state
+   ------------------------- */
+let active = [];
+let prevGrayMat = null;
+let prevFrameReady = false;
+let ptsMat = null, nextPtsMat = null, statusMat = null, errMat = null;
+const MOTION_THRESHOLD = 0.03;
+
+/* -------------------------
+   Audio & Beat Detection
+   ------------------------- */
+let audioCtx = null;
+let analyser = null;
+let audioBuffer = [];
+const AUDIO_BUFFER_MAX = 60;
+const VOLUME_SCALE = 100;
+const MIN_VOLUME_THRESHOLD = 0.25;
+const BEAT_THRESHOLD = 0.10;
+const BEAT_COOLDOWN = 180;
+const VOLUME_SIZE_THRESHOLD = 0.35;
+let lastBeatTime = 0;
+let audioEnabled = false;
+let lastAudioRms = 0;
+
+function pushAudioValue(v){
+  audioBuffer.push(v);
+  if(audioBuffer.length > AUDIO_BUFFER_MAX) audioBuffer.shift();
+}
+function getSmoothedRms(){
+  if(audioBuffer.length === 0) return 0.0;
+  const sum = audioBuffer.reduce((a,b)=>a+b,0);
+  return sum / audioBuffer.length;
+}
+
+async function startAudioStream(){
+  if(audioEnabled) return;
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    const source = audioCtx.createMediaStreamSource(stream);
+    analyser = audioCtx.createAnalyser();
+    analyser.fftSize = 1024;
+    source.connect(analyser);
+    audioEnabled = true;
+    hint.style.display = 'none';
+    audioLoop();
+    console.log('🎧 Audio actif');
+  } catch (e) {
+    console.warn('⚠️ Erreur audio :', e);
+    hint.innerText = 'Micro non autorisé';
+    setTimeout(()=>hint.style.display='none',3000);
+  }
+}
+
+function audioLoop(){
+  if(!analyser) return;
+  const data = new Float32Array(analyser.fftSize);
+  analyser.getFloatTimeDomainData(data);
+  let sumSq=0;
+  for(let i=0;i<data.length;i++) sumSq += data[i]*data[i];
+  const rms = Math.sqrt(sumSq / data.length) * VOLUME_SCALE;
+  lastAudioRms = rms;
+  pushAudioValue(rms);
+  requestAnimationFrame(audioLoop);
+}
+
+function handleAudioReactive(){
+  const now = performance.now();
+  const rmsSmooth = getSmoothedRms();
+
+  const delta = rmsSmooth - lastAudioRms;
+  let isBeat = false;
+  if (delta > BEAT_THRESHOLD && rmsSmooth > MIN_VOLUME_THRESHOLD && (now - lastBeatTime) > BEAT_COOLDOWN) {
+    isBeat = true;
+    lastBeatTime = now;
+  }
+
+  if (isBeat) {
+    const nSpawn = Math.min(3, 1 + Math.floor((rmsSmooth - MIN_VOLUME_THRESHOLD) * 3));
+    for (let i = 0; i < nSpawn; i++) {
+      const x = Math.random()*width;
+      const y = Math.random()*height;
+      const size = sampleSizeBell(min_size, max_size);
+      const label = Math.random().toString(36).substring(2,6).toUpperCase();
+      const font_scale = Math.random()*0.4 + 0.8;
+      const color = Math.random()>0.5 ? 'magenta' : 'white';
+      active.push(new TrackedPoint([x,y], life_frames, size, label, font_scale, color, false));
+    }
+  }
+
+  if (rmsSmooth > VOLUME_SIZE_THRESHOLD) {
+    const growth = 1 + Math.min((rmsSmooth - VOLUME_SIZE_THRESHOLD) * 0.05, 0.3);
+    for (const tp of active) {
+      tp.size = Math.min(tp.size * growth, max_size * 1.5);
+    }
+  }
+}
+
+/* -------------------------
+   OpenCV init
+   ------------------------- */
+function onOpenCvReady() {
+  loading.innerText = 'OpenCV loaded — initializing camera...';
+  startCamera();
+}
+if (typeof cv === 'undefined') {
+  let waitLoad = setInterval(()=>{
+    if(window.cv && cv.Mat){
+      clearInterval(waitLoad);
+      onOpenCvReady();
+    }
+  }, 100);
+} else {
+  onOpenCvReady();
+}
+
+async function startCamera(){
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "user" }, audio: false });
+    video.srcObject = stream;
+    await new Promise(resolve => video.onloadedmetadata = resolve);
+    width = video.videoWidth || width;
+    height = video.videoHeight || height;
+    canvas.width = width;
+    canvas.height = height;
+    initMats();
+    loading.style.display = 'none';
+    requestAnimationFrame(processFrame);
+  } catch (e) {
+    loading.innerText = 'Camera error: ' + e;
+    console.error(e);
+  }
+}
+
+function initMats(){
+  if(prevGrayMat){ try{ prevGrayMat.delete(); }catch(e){} }
+  prevGrayMat = new cv.Mat(height, width, cv.CV_8UC1);
+  prevGrayMat.setTo(new cv.Scalar(0));
+  prevFrameReady = false;
+  ptsMat = nextPtsMat = statusMat = errMat = null;
+}
+
+/* -------------------------
+   Optical flow & motion
+   ------------------------- */
+function createPtsMat(points){
+  const n = points.length;
+  if(n===0) return null;
+  const data = new Float32Array(n*2);
+  for(let i=0;i<n;i++){
+    data[i*2]   = points[i][0];
+    data[i*2+1] = points[i][1];
+  }
+  return cv.matFromArray(n, 1, cv.CV_32FC2, data);
+}
+function readPtsFromMat(mat){
+  const n = mat.rows;
+  const out = [];
+  const data = mat.data32F;
+  for(let i=0;i<n;i++){
+    out.push([data[i*2], data[i*2+1]]);
+  }
+  return out;
+}
+function updateTrackedWithLK(grayMat){
+  if(!prevFrameReady || active.length===0) return;
+  const pts = active.map(p => [p.pos[0], p.pos[1]]);
+  ptsMat = createPtsMat(pts);
+  nextPtsMat = new cv.Mat();
+  statusMat = new cv.Mat();
+  errMat = new cv.Mat();
+  try {
+    cv.calcOpticalFlowPyrLK(prevGrayMat, grayMat, ptsMat, nextPtsMat, statusMat, errMat, new cv.Size(21,21), 3);
+  } catch(e) { return; }
+  const nextPts = readPtsFromMat(nextPtsMat);
+  const status = Array.from(statusMat.data);
+  const newActive = [];
+  for(let i=0;i<active.length;i++){
+    if(!status[i]) continue;
+    const [nx, ny] = nextPts[i];
+    if(nx >= 0 && nx < width && ny >= 0 && ny < height && active[i].life > 0){
+      active[i].pos[0] = nx + randNormal()*jitter_px;
+      active[i].pos[1] = ny + randNormal()*jitter_px;
+      active[i].life -= 1;
+      newActive.push(active[i]);
+    }
+  }
+  active = newActive;
+  ptsMat.delete(); nextPtsMat.delete(); statusMat.delete(); errMat.delete();
+}
+
+function imageDataToGrayMat(imgData){
+  const src = cv.matFromImageData(imgData);
+  const gray = new cv.Mat();
+  cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY);
+  src.delete();
+  return gray;
+}
+
+function computeMotionAndMask(prevGray, gray){
+  const diff = new cv.Mat();
+  cv.absdiff(prevGray, gray, diff);
+  const f = new cv.Mat();
+  diff.convertTo(f, cv.CV_32F, 1.0/255.0);
+  cv.GaussianBlur(f, f, new cv.Size(21,21), 0);
+  const mask = new cv.Mat();
+  cv.threshold(f, mask, 0.07, 1.0, cv.THRESH_BINARY);
+  const mask8 = new cv.Mat();
+  mask.convertTo(mask8, cv.CV_8U, 255);
+  const meanScalar = cv.mean(mask);
+  const motion_intensity = meanScalar[0];
+  diff.delete(); f.delete(); mask.delete();
+  return {mask: mask8, intensity: motion_intensity};
+}
+
+function sampleIndicesFromMask(maskMat){
+  const rows = maskMat.rows, cols = maskMat.cols;
+  const idxs = [];
+  const block = 8;
+  for(let y=0;y<rows;y+=block){
+    for(let x=0;x<cols;x+=block){
+      const val = maskMat.ucharPtr(y,x)[0];
+      if (val > 0) idxs.push([x, y]);
+    }
+  }
+  return idxs;
+}
+
+function spawnPointsFromMotion(maskMat, motionIntensity){
+  if(motionIntensity < MOTION_THRESHOLD) return;
+  const indices = sampleIndicesFromMask(maskMat);
+  if(indices.length === 0) return;
+  const n_spawn_max = Math.max(0, Math.min(pts_per_frame, Math.round(pts_per_frame * Math.min(motionIntensity*50, 1))));
+  for(let k=0; k<n_spawn_max; k++){
+    const idx = indices[Math.floor(Math.random()*indices.length)];
+    const x = idx[0] + (Math.random()*8 - 4);
+    const y = idx[1] + (Math.random()*8 - 4);
+    const size = sampleSizeBell(Math.round(min_size/2), Math.round(max_size/1.3));
+    const label = Math.random().toString(36).substring(2,6).toUpperCase();
+    const font_scale = Math.random()*0.5 + 0.8;
+    const color = Math.random()>0.5 ? 'white' : 'magenta';
+    const vertical = Math.random() < 0.25;
+    active.push(new TrackedPoint([x,y], life_frames, size, label, font_scale, color, vertical));
+  }
+}
+
+/* -------------------------
+   Drawing
+   ------------------------- */
+function invertBoxesOnImage(imageData){
+  for(const tp of active){
+    const x = Math.round(tp.pos[0]);
+    const y = Math.round(tp.pos[1]);
+    const s = Math.round(tp.size);
+    const half = Math.floor(s/2);
+    const w = imageData.width, h = imageData.height;
+    for(let yy = -half; yy < half; yy++){
+      const yyabs = y + yy;
+      if(yyabs < 0 || yyabs >= h) continue;
+      for(let xx = -half; xx < half; xx++){
+        const xxabs = x + xx;
+        if(xxabs < 0 || xxabs >= w) continue;
+        const i = (yyabs * w + xxabs) * 4;
+        imageData.data[i]   = 255 - imageData.data[i];
+        imageData.data[i+1] = 255 - imageData.data[i+1];
+        imageData.data[i+2] = 255 - imageData.data[i+2];
+      }
+    }
+  }
+}
+function drawLinks(){
+  const coords = active.map(tp => tp.pos);
+  for(let i=0;i<coords.length;i++){
+    const p = coords[i];
+    const dists = [];
+    for(let j=0;j<coords.length;j++){
+      if(i===j) continue;
+      const dx = p[0] - coords[j][0];
+      const dy = p[1] - coords[j][1];
+      dists.push({j, dist: Math.hypot(dx,dy)});
+    }
+    dists.sort((a,b)=>a.dist-b.dist);
+    const limit = Math.min(neighbor_links, dists.length);
+    for(let m=0;m<limit;m++){
+      const q = coords[dists[m].j];
+      ctx.strokeStyle = 'white';
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(p[0], p[1]);
+      ctx.lineTo(q[0], q[1]);
+      ctx.stroke();
+    }
+  }
+}
+function drawRectOutlines(){
+  ctx.strokeStyle = 'white';
+  ctx.lineWidth = 1;
+  for(const tp of active){
+    const s = tp.size;
+    ctx.strokeRect(tp.pos[0] - s/2, tp.pos[1] - s/2, s, s);
+  }
+}
+function drawLabels(){
+  ctx.textBaseline = 'middle';
+  ctx.textAlign = 'left';
+  for(const tp of active){
+    ctx.fillStyle = tp.color;
+    ctx.font = `${Math.round(tp.font_scale * 12)}px monospace`;
+    if(tp.vertical){
+      let yCursor = tp.pos[1] - Math.floor(tp.size/2) + 2;
+      const line_h = Math.round(12 * tp.font_scale);
+      for(let c of tp.label){
+        ctx.fillText(c, tp.pos[0] + 2, yCursor);
+        yCursor += line_h;
+      }
+    } else {
+      ctx.fillText(tp.label, tp.pos[0] + 2, tp.pos[1] + Math.floor(tp.size/2) - 4);
+    }
+  }
+}
+
+/* -------------------------
+   Main loop
+   ------------------------- */
+function processFrame(){
+  ctx.drawImage(video, 0, 0, width, height);
+  const imgData = ctx.getImageData(0,0,width,height);
+  const grayMat = imageDataToGrayMat(imgData);
+
+  let maskMat = null;
+  let motionIntensity = 0;
+  if(prevFrameReady){
+    const res = computeMotionAndMask(prevGrayMat, grayMat);
+    maskMat = res.mask;
+    motionIntensity = res.intensity;
+  }
+
+  updateTrackedWithLK(grayMat);
+
+  if(audioEnabled) handleAudioReactive();
+  if(maskMat && !maskMat.isDeleted()) spawnPointsFromMotion(maskMat, motionIntensity);
+
+  invertBoxesOnImage(imgData);
+  ctx.putImageData(imgData, 0, 0);
+  drawLinks();
+  drawRectOutlines();
+  drawLabels();
+
+  grayMat.copyTo(prevGrayMat);
+  prevFrameReady = true;
+  grayMat.delete();
+  if(maskMat && !maskMat.isDeleted()) maskMat.delete();
+
+  active = active.filter(tp => tp.life-- > 0);
+  requestAnimationFrame(processFrame);
+}
+
+/* -------------------------
+   Enable audio on click
+   ------------------------- */
+window.addEventListener('click', startAudioStream, { once: true });
+window.addEventListener('touchstart', startAudioStream, { once: true });
+
+window.addEventListener('beforeunload', ()=>{
+  try{ if(prevGrayMat && !prevGrayMat.isDeleted()) prevGrayMat.delete(); }catch(e){}
+  try{ if(analyser && audioCtx) audioCtx.close(); }catch(e){}
+});
+</script>
+</body>
+</html>
